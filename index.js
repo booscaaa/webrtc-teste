@@ -5,13 +5,19 @@ const server = new WebSocket.Server({ port: 3000 });
 const clients = {};
 
 server.on('connection', (socket) => {
+  let userName = null;
+
   socket.on('message', (message) => {
     const data = JSON.parse(message);
-    
+
     switch (data.type) {
       case 'join':
-        clients[data.name] = socket;
-        broadcast({ type: 'new-user', name: data.name });
+        userName = data.name;
+        clients[userName] = socket;
+        // Envia a lista de usuários existentes para o novo usuário
+        socket.send(JSON.stringify({ type: 'user-list', users: Object.keys(clients) }));
+        // Notifica outros usuários sobre o novo usuário
+        broadcast({ type: 'new-user', name: data.name }, userName);
         break;
 
       case 'offer':
@@ -23,21 +29,24 @@ server.on('connection', (socket) => {
         break;
 
       case 'leave':
-        delete clients[data.name];
-        broadcast({ type: 'user-left', name: data.name });
+        delete clients[userName];
+        broadcast({ type: 'leave', name: userName }, userName);
         break;
     }
   });
 
   socket.on('close', () => {
-    const name = Object.keys(clients).find((key) => clients[key] === socket);
-    if (name) {
-      delete clients[name];
-      broadcast({ type: 'user-left', name });
+    if (userName) {
+      delete clients[userName];
+      broadcast({ type: 'leave', name: userName }, userName);
     }
   });
 });
 
-function broadcast(message) {
-  Object.values(clients).forEach(client => client.send(JSON.stringify(message)));
+function broadcast(message, exclude) {
+  Object.keys(clients).forEach((client) => {
+    if (client !== exclude) {
+      clients[client].send(JSON.stringify(message));
+    }
+  });
 }
