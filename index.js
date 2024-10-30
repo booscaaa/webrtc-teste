@@ -15,9 +15,9 @@ server.on('connection', (socket) => {
         userName = data.name;
         clients[userName] = socket;
         // Envia a lista de usuários existentes para o novo usuário
-        socket.send(JSON.stringify({ type: 'user-list', users: Object.keys(clients) }));
+        socket.send(JSON.stringify({ type: 'user-list', users: Object.keys(clients).filter(name => name !== userName) }));
         // Notifica outros usuários sobre o novo usuário
-        broadcast({ type: 'new-user', name: data.name }, userName);
+        broadcast({ type: 'new-user', name: userName }, userName);
         break;
 
       case 'offer':
