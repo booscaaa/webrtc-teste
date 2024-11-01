@@ -90,12 +90,9 @@ func (r *Room) Broadcast(message []byte, exclude string) {
 // RemoveClient removes a client from the room
 func (r *Room) RemoveClient(clientName string) {
 	r.Mutex.Lock()
-	defer r.Mutex.Unlock()
 	delete(r.Clients, clientName)
 	log.Printf("Client '%s' removed from room '%s'", clientName, r.Name)
-
 	r.Mutex.Unlock()
-
 	// Broadcast 'leave' message to others in the room
 	leaveMessage := map[string]interface{}{
 		"type": "leave",
