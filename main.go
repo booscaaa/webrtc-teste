@@ -47,6 +47,7 @@ func (s *Server) GetOrCreateRoom(roomName string) *Room {
 	defer s.Mutex.Unlock()
 
 	if room, exists := s.Rooms[roomName]; exists {
+		log.Printf("Room '%s' found. Reusing existing room.", roomName)
 		return room
 	}
 	room := &Room{
@@ -54,6 +55,7 @@ func (s *Server) GetOrCreateRoom(roomName string) *Room {
 		Clients: make(map[string]*Client),
 	}
 	s.Rooms[roomName] = room
+	log.Printf("Room '%s' created.", roomName)
 	return room
 }
 
@@ -62,9 +64,15 @@ func (r *Room) Broadcast(message []byte, exclude string) {
 	r.Mutex.Lock()
 	defer r.Mutex.Unlock()
 
+	log.Printf("Broadcasting message in room '%s' from '%s'", r.Name, exclude)
 	for name, client := range r.Clients {
 		if name != exclude {
-			client.Send <- message
+			select {
+			case client.Send <- message:
+				log.Printf("Message sent to client '%s' in room '%s'", name, r.Name)
+			default:
+				log.Printf("Send buffer full for client '%s' in room '%s'. Message dropped.", name, r.Name)
+			}
 		}
 	}
 }
@@ -74,15 +82,26 @@ func (r *Room) RemoveClient(clientName string) {
 	r.Mutex.Lock()
 	defer r.Mutex.Unlock()
 	delete(r.Clients, clientName)
+	log.Printf("Client '%s' removed from room '%s'", clientName, r.Name)
+
+	// Broadcast 'leave' message to others in the room
+	leaveMessage := map[string]interface{}{
+		"type": "leave",
+		"name": clientName,
+	}
+	leaveJSON, _ := json.Marshal(leaveMessage)
+	r.Broadcast(leaveJSON, "")
 }
 
 // handleWebSocket manages incoming WebSocket connections
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	log.Println("New WebSocket connection attempt")
 	socket, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Upgrade:", err)
+		log.Println("Upgrade error:", err)
 		return
 	}
+	log.Println("WebSocket connection established")
 
 	// Read initial join message
 	var initialMessage struct {
@@ -93,23 +112,25 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	_, message, err := socket.ReadMessage()
 	if err != nil {
-		log.Println("ReadMessage:", err)
+		log.Println("ReadMessage error during initial join:", err)
 		socket.Close()
 		return
 	}
+	log.Printf("Initial message received: %s", message)
 
 	err = json.Unmarshal(message, &initialMessage)
 	if err != nil || initialMessage.Type != "join" {
-		log.Println("Invalid join message:", err)
+		log.Println("Invalid join message format or type:", err)
 		socket.Close()
 		return
 	}
+	log.Printf("Client '%s' is joining room '%s'", initialMessage.Name, initialMessage.Room)
 
 	// Create and register the new client
 	client := &Client{
 		Name:   initialMessage.Name,
 		Socket: socket,
-		Send:   make(chan []byte),
+		Send:   make(chan []byte, 256), // Buffered channel to prevent blocking
 	}
 
 	// Get or create the room and add the client to it
@@ -119,6 +140,34 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	room.Mutex.Lock()
 	room.Clients[client.Name] = client
 	room.Mutex.Unlock()
+	log.Printf("Client '%s' added to room '%s'", client.Name, room.Name)
+
+	// Send user-list to the new client
+	var userList []string
+	room.Mutex.Lock()
+	for name := range room.Clients {
+		if name != client.Name {
+			userList = append(userList, name)
+		}
+	}
+	room.Mutex.Unlock()
+
+	userListMessage := map[string]interface{}{
+		"type":  "user-list",
+		"users": userList,
+	}
+	userListJSON, _ := json.Marshal(userListMessage)
+	client.Send <- userListJSON
+	log.Printf("User list sent to client '%s' in room '%s'", client.Name, room.Name)
+
+	// Broadcast new-user to other clients in the room
+	newUserMessage := map[string]interface{}{
+		"type": "new-user",
+		"name": client.Name,
+	}
+	newUserJSON, _ := json.Marshal(newUserMessage)
+	room.Broadcast(newUserJSON, client.Name)
+	log.Printf("New user '%s' broadcasted in room '%s'", client.Name, room.Name)
 
 	// Start reading and writing messages for the client
 	go client.writeMessages()
@@ -128,32 +177,48 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 // readMessages listens for incoming messages from the client and routes them
 func (c *Client) readMessages() {
 	defer func() {
+		log.Printf("Client '%s' disconnected from room '%s'", c.Name, c.Room.Name)
 		c.Room.RemoveClient(c.Name)
 		c.Socket.Close()
+		close(c.Send)
 	}()
 
 	for {
 		_, message, err := c.Socket.ReadMessage()
 		if err != nil {
-			log.Println("ReadMessage:", err)
+			log.Println("ReadMessage error:", err)
 			break
 		}
+		log.Printf("Message received from client '%s': %s", c.Name, message)
 
 		// Parse the incoming message
 		var data map[string]interface{}
 		if err := json.Unmarshal(message, &data); err != nil {
-			log.Println("Invalid message format:", err)
+			log.Println("Invalid message format from client:", err)
 			continue
 		}
 
+		messageType, _ := data["type"].(string)
+
 		// Handle message types based on the parsed data
-		if target, ok := data["target"].(string); ok && (data["type"] == "offer" || data["type"] == "answer" || data["type"] == "candidate") {
+		if target, ok := data["target"].(string); ok && (messageType == "offer" || messageType == "answer" || messageType == "candidate") {
 			// Send the message to a specific target within the same room
-			if targetClient, exists := c.Room.Clients[target]; exists {
-				targetClient.Send <- message
+			c.Room.Mutex.Lock()
+			targetClient, exists := c.Room.Clients[target]
+			c.Room.Mutex.Unlock()
+			if exists {
+				select {
+				case targetClient.Send <- message:
+					log.Printf("Message of type '%s' from '%s' forwarded to '%s' in room '%s'", messageType, c.Name, target, c.Room.Name)
+				default:
+					log.Printf("Send buffer full for client '%s'. Message dropped.", target)
+				}
+			} else {
+				log.Printf("Target client '%s' not found in room '%s'", target, c.Room.Name)
 			}
 		} else {
 			// Broadcast the message to the room
+			log.Printf("Broadcasting message of type '%s' from '%s' in room '%s'", messageType, c.Name, c.Room.Name)
 			c.Room.Broadcast(message, c.Name)
 		}
 	}
@@ -164,9 +229,10 @@ func (c *Client) writeMessages() {
 	defer c.Socket.Close()
 	for message := range c.Send {
 		if err := c.Socket.WriteMessage(websocket.TextMessage, message); err != nil {
-			log.Println("WriteMessage:", err)
+			log.Println("WriteMessage error:", err)
 			break
 		}
+		log.Printf("Message sent to client '%s': %s", c.Name, message)
 	}
 }
 
