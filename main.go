@@ -59,6 +59,17 @@ func (s *Server) GetOrCreateRoom(roomName string) *Room {
 	return room
 }
 
+// ClientList returns a list of client names in the room
+func (r *Room) ClientList() []string {
+	r.Mutex.Lock()
+	defer r.Mutex.Unlock()
+	clientNames := make([]string, 0, len(r.Clients))
+	for name := range r.Clients {
+		clientNames = append(clientNames, name)
+	}
+	return clientNames
+}
+
 // Broadcast sends a message to all clients in the room except the sender
 func (r *Room) Broadcast(message []byte, exclude string) {
 	r.Mutex.Lock()
@@ -68,7 +79,7 @@ func (r *Room) Broadcast(message []byte, exclude string) {
 		if name != exclude {
 			select {
 			case client.Send <- message:
-				log.Printf("Message sent to client '%s' in room '%s'", name, r.Name)
+				log.Printf("Message broadcasted to '%s' in room '%s'", name, r.Name)
 			default:
 				log.Printf("Send buffer full for client '%s' in room '%s'. Message dropped.", name, r.Name)
 			}
@@ -160,7 +171,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			room.Clients[client.Name] = client
 			room.Mutex.Unlock()
-			log.Printf("Client '%s' added to room '%s'", client.Name, room.Name)
+			log.Printf("Client '%s' added to room '%s'. Current clients in room: %v", client.Name, room.Name, room.ClientList())
 
 			// Initialize userList as an empty slice
 			userList := make([]string, 0)
@@ -216,7 +227,7 @@ func (c *Client) readMessages() {
 			log.Println("ReadMessage error:", err)
 			break
 		}
-		log.Printf("Message received from client '%s': %s", c.Name, message)
+		log.Printf("Message received from client '%s' in room '%s': %s", c.Name, c.Room.Name, message)
 
 		// Parse the incoming message
 		var data map[string]interface{}
@@ -239,11 +250,16 @@ func (c *Client) readMessages() {
 			targetClient, exists := c.Room.Clients[target]
 			c.Room.Mutex.Unlock()
 			if exists {
-				select {
-				case targetClient.Send <- message:
-					log.Printf("Message of type '%s' from '%s' forwarded to '%s' in room '%s'", messageType, c.Name, target, c.Room.Name)
-				default:
-					log.Printf("Send buffer full for client '%s'. Message dropped.", target)
+				// Ensure the target client is in the same room
+				if targetClient.Room.Name == c.Room.Name {
+					select {
+					case targetClient.Send <- message:
+						log.Printf("Message of type '%s' from '%s' forwarded to '%s' in room '%s'", messageType, c.Name, target, c.Room.Name)
+					default:
+						log.Printf("Send buffer full for client '%s'. Message dropped.", target)
+					}
+				} else {
+					log.Printf("Target client '%s' is not in the same room '%s'", target, c.Room.Name)
 				}
 			} else {
 				log.Printf("Target client '%s' not found in room '%s'", target, c.Room.Name)
