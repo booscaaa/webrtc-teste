@@ -103,31 +103,25 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Println("WebSocket connection established")
 
-	// Create a channel to handle messages after initial join
-	messageChan := make(chan []byte)
+	// Create the client with empty Name and Room
+	client := &Client{
+		Name:   "",
+		Socket: socket,
+		Send:   make(chan []byte, 256),
+	}
 
-	// Read initial messages in a goroutine
-	go func() {
-		for {
-			_, message, err := socket.ReadMessage()
-			if err != nil {
-				log.Println("ReadMessage error during initial join:", err)
-				socket.Close()
-				return
-			}
-			log.Printf("Initial message received: %s", message)
-			messageChan <- message
-		}
-	}()
+	// Start writing messages for the client
+	go client.writeMessages()
 
-	// Wait for the 'join' message to proceed
-	var client *Client
+	// Read initial messages until we get a 'join' message
 	for {
-		message, ok := <-messageChan
-		if !ok {
-			log.Println("Failed to receive initial message")
+		_, message, err := socket.ReadMessage()
+		if err != nil {
+			log.Println("ReadMessage error during initial join:", err)
+			socket.Close()
 			return
 		}
+		log.Printf("Initial message received: %s", message)
 		var data map[string]interface{}
 		if err := json.Unmarshal(message, &data); err != nil {
 			log.Println("Invalid message format:", err)
@@ -141,11 +135,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				log.Println("Invalid join message: missing name or room")
 				continue
 			}
-			client = &Client{
-				Name:   name,
-				Socket: socket,
-				Send:   make(chan []byte, 256),
-			}
+			client.Name = name
+
 			// Get or create the room and add the client to it
 			room := server.GetOrCreateRoom(roomName)
 			client.Room = room
@@ -184,8 +175,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			room.Broadcast(newUserJSON, client.Name)
 			log.Printf("New user '%s' broadcasted in room '%s'", client.Name, room.Name)
 
-			// Start reading and writing messages for the client
-			go client.writeMessages()
+			// Now that the client is fully initialized, start reading messages
 			go client.readMessages()
 
 			break // Exit the loop after processing 'join'
