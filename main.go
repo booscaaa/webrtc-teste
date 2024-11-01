@@ -219,6 +219,7 @@ func (c *Client) readMessages() {
 		c.Room.RemoveClient(c.Name)
 		c.Socket.Close()
 		close(c.Send)
+		log.Printf("Client '%s' has been cleaned up", c.Name)
 	}()
 
 	for {
@@ -267,6 +268,7 @@ func (c *Client) readMessages() {
 		case "leave":
 			// Handle client leaving
 			log.Printf("Client '%s' is leaving room '%s'", c.Name, c.Room.Name)
+			c.Socket.Close()
 			return
 		default:
 			// Unknown message type; ignore or handle as needed
