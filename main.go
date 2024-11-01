@@ -64,7 +64,6 @@ func (r *Room) Broadcast(message []byte, exclude string) {
 	r.Mutex.Lock()
 	defer r.Mutex.Unlock()
 
-	log.Printf("Broadcasting message in room '%s' from '%s'", r.Name, exclude)
 	for name, client := range r.Clients {
 		if name != exclude {
 			select {
@@ -129,12 +128,23 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		messageType, _ := data["type"].(string)
 		if messageType == "join" {
-			name, _ := data["name"].(string)
-			roomName, _ := data["room"].(string)
-			if name == "" || roomName == "" {
+			nameInterface, nameExists := data["name"]
+			roomInterface, roomExists := data["room"]
+			if !nameExists || !roomExists {
 				log.Println("Invalid join message: missing name or room")
 				continue
 			}
+			name, ok := nameInterface.(string)
+			if !ok {
+				log.Println("Invalid join message: 'name' field is not a string")
+				continue
+			}
+			roomName, ok := roomInterface.(string)
+			if !ok {
+				log.Println("Invalid join message: 'room' field is not a string")
+				continue
+			}
+			log.Printf("Client '%s' is joining room '%s'", name, roomName)
 			client.Name = name
 
 			// Get or create the room and add the client to it
@@ -142,7 +152,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			client.Room = room
 
 			room.Mutex.Lock()
-			// Check if a client with the same name already exists
+			// Check if a client with the same name already exists in the room
 			if existingClient, exists := room.Clients[client.Name]; exists {
 				log.Printf("Client with name '%s' already exists in room '%s'. Removing existing client.", client.Name, room.Name)
 				existingClient.Socket.Close()
