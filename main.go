@@ -32,7 +32,7 @@ type Server struct {
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for testing purposes; you might want to restrict this in production
+		return true // Allow all origins; adjust in production
 	},
 }
 
@@ -103,75 +103,94 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Println("WebSocket connection established")
 
-	// Read initial join message
-	var initialMessage struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
-		Room string `json:"room"`
-	}
+	// Create a channel to handle messages after initial join
+	messageChan := make(chan []byte)
 
-	_, message, err := socket.ReadMessage()
-	if err != nil {
-		log.Println("ReadMessage error during initial join:", err)
-		socket.Close()
-		return
-	}
-	log.Printf("Initial message received: %s", message)
+	// Read initial messages in a goroutine
+	go func() {
+		for {
+			_, message, err := socket.ReadMessage()
+			if err != nil {
+				log.Println("ReadMessage error during initial join:", err)
+				socket.Close()
+				return
+			}
+			log.Printf("Initial message received: %s", message)
+			messageChan <- message
+		}
+	}()
 
-	err = json.Unmarshal(message, &initialMessage)
-	if err != nil || initialMessage.Type != "join" {
-		log.Println("Invalid join message format or type:", err)
-		socket.Close()
-		return
-	}
-	log.Printf("Client '%s' is joining room '%s'", initialMessage.Name, initialMessage.Room)
+	// Wait for the 'join' message to proceed
+	var client *Client
+	for {
+		message, ok := <-messageChan
+		if !ok {
+			log.Println("Failed to receive initial message")
+			return
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal(message, &data); err != nil {
+			log.Println("Invalid message format:", err)
+			continue
+		}
+		messageType, _ := data["type"].(string)
+		if messageType == "join" {
+			name, _ := data["name"].(string)
+			roomName, _ := data["room"].(string)
+			if name == "" || roomName == "" {
+				log.Println("Invalid join message: missing name or room")
+				continue
+			}
+			client = &Client{
+				Name:   name,
+				Socket: socket,
+				Send:   make(chan []byte, 256),
+			}
+			// Get or create the room and add the client to it
+			room := server.GetOrCreateRoom(roomName)
+			client.Room = room
 
-	// Create and register the new client
-	client := &Client{
-		Name:   initialMessage.Name,
-		Socket: socket,
-		Send:   make(chan []byte, 256), // Buffered channel to prevent blocking
-	}
+			room.Mutex.Lock()
+			room.Clients[client.Name] = client
+			room.Mutex.Unlock()
+			log.Printf("Client '%s' added to room '%s'", client.Name, room.Name)
 
-	// Get or create the room and add the client to it
-	room := server.GetOrCreateRoom(initialMessage.Room)
-	client.Room = room
+			// Send user-list to the new client
+			var userList []string
+			room.Mutex.Lock()
+			for name := range room.Clients {
+				if name != client.Name {
+					userList = append(userList, name)
+				}
+			}
+			room.Mutex.Unlock()
 
-	room.Mutex.Lock()
-	room.Clients[client.Name] = client
-	room.Mutex.Unlock()
-	log.Printf("Client '%s' added to room '%s'", client.Name, room.Name)
+			userListMessage := map[string]interface{}{
+				"type":  "user-list",
+				"users": userList,
+			}
+			userListJSON, _ := json.Marshal(userListMessage)
+			client.Send <- userListJSON
+			log.Printf("User list sent to client '%s' in room '%s'", client.Name, room.Name)
 
-	// Send user-list to the new client
-	var userList []string
-	room.Mutex.Lock()
-	for name := range room.Clients {
-		if name != client.Name {
-			userList = append(userList, name)
+			// Broadcast new-user to other clients in the room
+			newUserMessage := map[string]interface{}{
+				"type": "new-user",
+				"name": client.Name,
+			}
+			newUserJSON, _ := json.Marshal(newUserMessage)
+			room.Broadcast(newUserJSON, client.Name)
+			log.Printf("New user '%s' broadcasted in room '%s'", client.Name, room.Name)
+
+			// Start reading and writing messages for the client
+			go client.writeMessages()
+			go client.readMessages()
+
+			break // Exit the loop after processing 'join'
+		} else {
+			log.Println("Expected 'join' message, received:", messageType)
 		}
 	}
-	room.Mutex.Unlock()
-
-	userListMessage := map[string]interface{}{
-		"type":  "user-list",
-		"users": userList,
-	}
-	userListJSON, _ := json.Marshal(userListMessage)
-	client.Send <- userListJSON
-	log.Printf("User list sent to client '%s' in room '%s'", client.Name, room.Name)
-
-	// Broadcast new-user to other clients in the room
-	newUserMessage := map[string]interface{}{
-		"type": "new-user",
-		"name": client.Name,
-	}
-	newUserJSON, _ := json.Marshal(newUserMessage)
-	room.Broadcast(newUserJSON, client.Name)
-	log.Printf("New user '%s' broadcasted in room '%s'", client.Name, room.Name)
-
-	// Start reading and writing messages for the client
-	go client.writeMessages()
-	go client.readMessages()
 }
 
 // readMessages listens for incoming messages from the client and routes them
@@ -200,8 +219,13 @@ func (c *Client) readMessages() {
 
 		messageType, _ := data["type"].(string)
 
-		// Handle message types based on the parsed data
-		if target, ok := data["target"].(string); ok && (messageType == "offer" || messageType == "answer" || messageType == "candidate") {
+		switch messageType {
+		case "offer", "answer", "candidate":
+			target, _ := data["target"].(string)
+			if target == "" {
+				log.Println("Message missing 'target' field")
+				continue
+			}
 			// Send the message to a specific target within the same room
 			c.Room.Mutex.Lock()
 			targetClient, exists := c.Room.Clients[target]
@@ -216,10 +240,13 @@ func (c *Client) readMessages() {
 			} else {
 				log.Printf("Target client '%s' not found in room '%s'", target, c.Room.Name)
 			}
-		} else {
-			// Broadcast the message to the room
-			log.Printf("Broadcasting message of type '%s' from '%s' in room '%s'", messageType, c.Name, c.Room.Name)
-			c.Room.Broadcast(message, c.Name)
+		case "leave":
+			// Handle client leaving
+			log.Printf("Client '%s' is leaving room '%s'", c.Name, c.Room.Name)
+			return
+		default:
+			// Unknown message type; ignore or handle as needed
+			log.Printf("Unknown message type '%s' from client '%s'", messageType, c.Name)
 		}
 	}
 }
