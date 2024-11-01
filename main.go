@@ -142,6 +142,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			client.Room = room
 
 			room.Mutex.Lock()
+			// Check if a client with the same name already exists
+			if existingClient, exists := room.Clients[client.Name]; exists {
+				log.Printf("Client with name '%s' already exists in room '%s'. Removing existing client.", client.Name, room.Name)
+				existingClient.Socket.Close()
+				delete(room.Clients, client.Name)
+			}
 			room.Clients[client.Name] = client
 			room.Mutex.Unlock()
 			log.Printf("Client '%s' added to room '%s'", client.Name, room.Name)
@@ -188,7 +194,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 // readMessages listens for incoming messages from the client and routes them
 func (c *Client) readMessages() {
 	defer func() {
-		log.Printf("Client '%s' disconnected from room '%s'", c.Name, c.Room.Name)
+		log.Printf("Client '%s' readMessages exiting", c.Name)
 		c.Room.RemoveClient(c.Name)
 		c.Socket.Close()
 		close(c.Send)
@@ -245,7 +251,10 @@ func (c *Client) readMessages() {
 
 // writeMessages sends outgoing messages from the client's send channel
 func (c *Client) writeMessages() {
-	defer c.Socket.Close()
+	defer func() {
+		log.Printf("Client '%s' writeMessages exiting", c.Name)
+		c.Socket.Close()
+	}()
 	for message := range c.Send {
 		if err := c.Socket.WriteMessage(websocket.TextMessage, message); err != nil {
 			log.Println("WriteMessage error:", err)
