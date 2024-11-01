@@ -155,8 +155,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			room.Mutex.Unlock()
 			log.Printf("Client '%s' added to room '%s'", client.Name, room.Name)
 
+			// Initialize userList as an empty slice
+			userList := make([]string, 0)
+
 			// Send user-list to the new client
-			var userList []string
 			room.Mutex.Lock()
 			for name := range room.Clients {
 				if name != client.Name {
